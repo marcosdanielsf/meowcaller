@@ -131,9 +131,16 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 	}
 	done := make(chan result, 1)
 	go func() {
-		defer e.recoverPanic("relay_connect", "")
-		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
-		done <- result{ch, err}
+		var ch *relay.RelayMediaChannel
+		var err error
+		defer func() { done <- result{ch, err} }()
+		defer func() {
+			if r := recover(); r != nil {
+				e.logPanic("relay_connect", "", r)
+				ch, err = nil, fmt.Errorf("relay connect panic: %v", r)
+			}
+		}()
+		ch, err = relay.ConnectRelayMedia(addr, relay.WithLogger(log))
 	}()
 	var ch *relay.RelayMediaChannel
 	select {
@@ -296,17 +303,24 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				if err = ctx.Err(); err != nil {
 					return err
 				}
-				e.mu.Lock()
-				current := e.calls[callID]
-				if current == nil || !current.group || current.groupUpdate == nil ||
-					!current.hasGroupEpoch || len(current.groupRawEpoch) != 32 {
-					e.mu.Unlock()
+				var update groupCallUpdate
+				var rawEpoch []byte
+				var transactionID uint32
+				prerequisitesOK := false
+				e.withLock(func() {
+					current := e.calls[callID]
+					if current == nil || !current.group || current.groupUpdate == nil ||
+						!current.hasGroupEpoch || len(current.groupRawEpoch) != 32 {
+						return
+					}
+					update = cloneGroupCallUpdate(*current.groupUpdate)
+					rawEpoch = append([]byte(nil), current.groupRawEpoch...)
+					transactionID = current.groupEpochTxID
+					prerequisitesOK = true
+				})
+				if !prerequisitesOK {
 					return fmt.Errorf("meowcaller: group media prerequisites changed during startup")
 				}
-				update := cloneGroupCallUpdate(*current.groupUpdate)
-				rawEpoch := append([]byte(nil), current.groupRawEpoch...)
-				transactionID := current.groupEpochTxID
-				e.mu.Unlock()
 
 				if err = audioReceivers.ApplyGroupUpdate(update); err == nil {
 					err = audioReceivers.ApplyGroupRawEpoch(transactionID, rawEpoch)
@@ -316,31 +330,43 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					return fmt.Errorf("initialize group participant media: %w", err)
 				}
 
-				e.mu.Lock()
-				current = e.calls[callID]
-				if current == nil || !current.group {
-					e.mu.Unlock()
+				const (
+					publishEnded = iota
+					publishReplaced
+					publishInstalled
+					publishRetry
+				)
+				outcome := publishRetry
+				discarded := audioReceivers
+				e.withLock(func() {
+					current := e.calls[callID]
+					if current == nil || !current.group {
+						outcome = publishEnded
+						return
+					}
+					if current.groupReceivers != nil {
+						audioReceivers = current.groupReceivers
+						outcome = publishReplaced
+						return
+					}
+					if current.groupUpdate != nil &&
+						current.groupUpdate.TransactionID <= update.TransactionID &&
+						current.groupEpochTxID <= transactionID {
+						current.groupReceivers = audioReceivers
+						outcome = publishInstalled
+					}
+				})
+				if outcome == publishEnded {
 					return fmt.Errorf("meowcaller: group call ended during media startup")
 				}
-				if current.groupReceivers != nil {
-					discarded := audioReceivers
-					audioReceivers = current.groupReceivers
-					e.mu.Unlock()
+				if outcome == publishReplaced {
 					discarded.clear()
+				}
+				if outcome == publishReplaced || outcome == publishInstalled {
 					unpublishedReceivers = nil
 					installed = true
 					break
 				}
-				if current.groupUpdate != nil &&
-					current.groupUpdate.TransactionID <= update.TransactionID &&
-					current.groupEpochTxID <= transactionID {
-					current.groupReceivers = audioReceivers
-					e.mu.Unlock()
-					unpublishedReceivers = nil
-					installed = true
-					break
-				}
-				e.mu.Unlock()
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -354,19 +380,25 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				)
 			}
 		} else {
-			e.mu.Lock()
-			current := e.calls[callID]
-			if current == nil {
-				e.mu.Unlock()
+			var discarded *participantReceiveRegistry
+			callEnded := false
+			e.withLock(func() {
+				current := e.calls[callID]
+				if current == nil {
+					callEnded = true
+					return
+				}
+				if current.groupReceivers == nil {
+					current.groupReceivers = audioReceivers
+					return
+				}
+				discarded = audioReceivers
+				audioReceivers = current.groupReceivers
+			})
+			if callEnded {
 				return fmt.Errorf("meowcaller: direct call ended during media startup")
 			}
-			if current.groupReceivers == nil {
-				current.groupReceivers = audioReceivers
-				e.mu.Unlock()
-			} else {
-				discarded := audioReceivers
-				audioReceivers = current.groupReceivers
-				e.mu.Unlock()
+			if discarded != nil {
 				discarded.clear()
 			}
 			unpublishedReceivers = nil
@@ -495,21 +527,19 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			_, _ = rand.Read(tx[:])
 			ping := stun.BuildWhatsappPing(tx, log)
 			allocateSent := false
-			e.mu.Lock()
-			currentCall := e.calls[callID]
-			if currentCall != nil && currentCall.group {
-				groupMode.Store(true)
-			}
-			e.mu.Unlock()
-			if groupMode.Load() {
-				e.mu.Lock()
-				current := e.calls[callID]
-				var update *groupCallUpdate
-				if current != nil && current.groupUpdate != nil {
-					cloned := cloneGroupCallUpdate(*current.groupUpdate)
-					update = &cloned
+			e.withLock(func() {
+				if currentCall := e.calls[callID]; currentCall != nil && currentCall.group {
+					groupMode.Store(true)
 				}
-				e.mu.Unlock()
+			})
+			if groupMode.Load() {
+				var update *groupCallUpdate
+				e.withLock(func() {
+					if current := e.calls[callID]; current != nil && current.groupUpdate != nil {
+						cloned := cloneGroupCallUpdate(*current.groupUpdate)
+						update = &cloned
+					}
+				})
 				if update != nil && update.Relay != nil {
 					var relayTx [12]byte
 					if _, err := rand.Read(relayTx[:]); err == nil {
@@ -615,26 +645,24 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	rekeyPeer := func(answeringPeer string) error {
 		return audioReceivers.RekeyFallback(answeringPeer)
 	}
-	e.mu.Lock()
 	currentPeer := peerLID
-	if m := e.calls[callID]; m != nil {
-		m.rekeyPeer = rekeyPeer
-		currentPeer = m.peerLID
-	}
-	e.mu.Unlock()
+	e.withLock(func() {
+		if m := e.calls[callID]; m != nil {
+			m.rekeyPeer = rekeyPeer
+			currentPeer = m.peerLID
+		}
+	})
 	if currentPeer != "" && currentPeer != peerLID {
 		if err := rekeyPeer(currentPeer); err != nil {
 			return fmt.Errorf("rekey media to answering device: %w", err)
 		}
 		peerLID = currentPeer
 	}
-	defer func() {
-		e.mu.Lock()
+	defer e.withLock(func() {
 		if m := e.calls[callID]; m != nil {
 			m.rekeyPeer = nil
 		}
-		e.mu.Unlock()
-	}()
+	})
 	videoReceiveStates := make(map[*participantAudioReceiver]*videoReceiveState)
 	appDataReceivers := make(map[*participantAudioReceiver]*appDataReceiver)
 	lastVideoPLI := make(map[uint32]time.Time)
@@ -679,38 +707,37 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		}
 		return ch.Send(packet)
 	})
-	e.mu.Lock()
-	if m := e.calls[callID]; m != nil {
-		vsender.active = m.localVideo
-		vsender.sendGated = m.videoGate
-		m.videoTx = vsender
-		m.appDataTx = appSender
-	}
-	e.mu.Unlock()
+	e.withLock(func() {
+		if m := e.calls[callID]; m != nil {
+			vsender.active = m.localVideo
+			vsender.sendGated = m.videoGate
+			m.videoTx = vsender
+			m.appDataTx = appSender
+		}
+	})
 	defer func() {
 		appSender.close()
 		vsender.mu.Lock()
 		vsender.ch = nil
 		vsender.mu.Unlock()
-		e.mu.Lock()
-		if m := e.calls[callID]; m != nil {
-			m.videoTx = nil
-			m.appDataTx = nil
-		}
-		e.mu.Unlock()
+		e.withLock(func() {
+			if m := e.calls[callID]; m != nil {
+				m.videoTx = nil
+				m.appDataTx = nil
+			}
+		})
 	}()
 
 	var audioReception rtp.RtcpReceptionStatsSet
 	var videoReception rtp.RtcpReceptionStatsSet
 	if groupMode.Load() {
-		e.mu.Lock()
-		current := e.calls[callID]
 		var update *groupCallUpdate
-		if current != nil && current.groupUpdate != nil {
-			cloned := cloneGroupCallUpdate(*current.groupUpdate)
-			update = &cloned
-		}
-		e.mu.Unlock()
+		e.withLock(func() {
+			if current := e.calls[callID]; current != nil && current.groupUpdate != nil {
+				cloned := cloneGroupCallUpdate(*current.groupUpdate)
+				update = &cloned
+			}
+		})
 		if update == nil || update.Relay == nil {
 			return fmt.Errorf("meowcaller: group media started without an authoritative relay snapshot")
 		}
@@ -754,12 +781,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				return
 			case now := <-ticker.C:
 				nowMs := uint64(now.UnixMilli())
-				e.mu.Lock()
-				current := e.calls[callID]
-				if current != nil && current.group {
-					groupMode.Store(true)
-				}
-				e.mu.Unlock()
+				e.withLock(func() {
+					if current := e.calls[callID]; current != nil && current.group {
+						groupMode.Store(true)
+					}
+				})
 				if groupMode.Load() {
 					audioReception.Retain(audioReceivers.ActiveAudioSSRCs())
 					videoReception.Retain(audioReceivers.ActiveVideoSSRCs())

@@ -3,6 +3,7 @@ package meowcaller
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/types"
@@ -47,5 +48,35 @@ func TestEnsureSelfDeviceMantemTodosOsDevices(t *testing.T) {
 	got = ensureSelfDevice(nil, self)
 	if len(got) != 1 || got[0] != self {
 		t.Fatalf("lista vazia deveria virar so o gateway: %v", got)
+	}
+}
+
+func TestPanicDentroDeSecaoTravadaNaoPrendeOEngine(t *testing.T) {
+	e := &engine{c: &Client{log: zerolog.Nop()}, calls: map[string]*engineCall{"c1": {}}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer e.recoverPanic("teste", "c1")
+		e.withLock(func() { panic("dentro da secao locked") })
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("engine travou: mutex ficou preso apos o panic")
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		e.finishCall("c1", "again")
+		e.mu.Lock()
+		e.mu.Unlock() //nolint:staticcheck // prova que o mutex esta livre
+	}()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("novo finishCall/lock travou depois do panic")
+	}
+	if _, ok := e.calls["c1"]; ok {
+		t.Fatal("chamada deveria ter sido encerrada")
 	}
 }
