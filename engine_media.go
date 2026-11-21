@@ -100,6 +100,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
 	go func() {
+		defer e.recoverPanic("run_media", callID)
 		defer clear(callKey)
 		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
@@ -130,6 +131,7 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSs
 	}
 	done := make(chan result, 1)
 	go func() {
+		defer e.recoverPanic("relay_connect", "")
 		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
 		done <- result{ch, err}
 	}()
@@ -385,6 +387,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	audioMixer := newParticipantAudioMixer()
 	var audioSinkFramer participantAudioSinkFramer
 	go func() {
+		defer e.recoverPanic("group_audio_mixer", callID)
 		ticker := time.NewTicker(time.Duration(participantAudioMixChunkSamples) * time.Second / SampleRate)
 		defer ticker.Stop()
 		playoutStarted := false
@@ -459,6 +462,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Inbound calls are torn down by the caller within ~400ms if the relay bind never
 	// comes alive; check at 400ms and 900ms and say so explicitly.
 	go func() {
+		defer e.recoverPanic("bind_watch", callID)
 		for _, d := range []time.Duration{400 * time.Millisecond, 900 * time.Millisecond} {
 			select {
 			case <-ctx.Done():
@@ -477,6 +481,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Binding-requests instead flip the relay into ICE-consent mode and the bridge never
 	// forms.
 	go func() {
+		defer e.recoverPanic("relay_keepalive", callID)
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		var tickCount uint64
@@ -561,6 +566,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// Player has real audio (nextFrame() == nil means send silence).
 	frameInterval := time.Duration(FrameSamples) * time.Second / SampleRate
 	go func() {
+		defer e.recoverPanic("silence_sender", callID)
 		silence := make([]float32, FrameSamples)
 		ticker := time.NewTicker(frameInterval)
 		defer ticker.Stop()
@@ -738,6 +744,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	// SR+SDES packets are required for the caller's video to start flowing to the
 	// answerer, and give the peer a target for PLI/FIR recovery feedback.
 	go func() {
+		defer e.recoverPanic("srtcp_sender", callID)
 		ticker := time.NewTicker(1500 * time.Millisecond)
 		defer ticker.Stop()
 		var sent uint64

@@ -303,7 +303,7 @@ func (e *engine) discoverGroupParticipants(
 		byUser[user] = append(byUser[user], device)
 	}
 	self := e.c.wa.Store.GetLID()
-	byUser[self.ToNonAD()] = []types.JID{self}
+	byUser[self.ToNonAD()] = ensureSelfDevice(byUser[self.ToNonAD()], self)
 	participants := make([]signaling.GroupCallParticipant, 0, len(users))
 	for _, user := range users {
 		user = user.ToNonAD()
@@ -323,6 +323,27 @@ func (e *engine) discoverGroupParticipants(
 		participants = append(participants, participant)
 	}
 	return participants, nil
+}
+
+// ensureSelfDevice garante que o device do gateway esteja na lista dos nossos
+// devices SEM descartar os demais (celular e vinculados). O servidor valida o
+// phash contra a lista completa; listar so o gateway gera erro 411 no ACK.
+func ensureSelfDevice(devices []types.JID, self types.JID) []types.JID {
+	out := make([]types.JID, 0, len(devices)+1)
+	seen := false
+	for _, d := range devices {
+		if d == self {
+			if seen {
+				continue
+			}
+			seen = true
+		}
+		out = append(out, d)
+	}
+	if !seen {
+		out = append(out, self)
+	}
+	return out
 }
 
 func parseOptionalGroupJID(raw string) (types.JID, error) {
@@ -606,6 +627,7 @@ func (e *engine) startWaitingRoomHeartbeat(callID string) {
 	creator := m.creator
 	e.mu.Unlock()
 	go func() {
+		defer e.recoverPanic("waiting_room_heartbeat", callID)
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {

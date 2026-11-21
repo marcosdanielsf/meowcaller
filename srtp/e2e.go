@@ -33,6 +33,9 @@ const (
 // byte 7, zero-padded to 16, then AES-128-CTR keystream over len zero bytes.
 func aesCmKdf(masterKey, masterSalt []byte, label byte, length int) ([]byte, error) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/e2e_srtp.rs#L24-L32
+	if len(masterSalt) < 14 {
+		return nil, errShortKey
+	}
 	var iv [16]byte
 	copy(iv[:14], masterSalt[:14])
 	iv[7] ^= label
