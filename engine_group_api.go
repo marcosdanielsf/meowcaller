@@ -33,7 +33,7 @@ func (e *engine) placeGroupCall(
 	if err != nil {
 		return nil, err
 	}
-	participants, err := e.discoverGroupParticipants(ctx, append([]types.JID{self.ToNonAD()}, selected...))
+	participants, err := e.discoverGroupParticipants(ctx, append([]types.JID{self.ToNonAD()}, selected...), opts.OfferAllDevices)
 	if err != nil {
 		return nil, err
 	}
@@ -291,9 +291,18 @@ func (e *engine) resolveGroupTargets(
 func (e *engine) discoverGroupParticipants(
 	ctx context.Context,
 	users []types.JID,
+	offerAllDevices bool,
 ) ([]signaling.GroupCallParticipant, error) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/7cb6045001dafd2514f53e85cd8c3e419c13adbe/datasheets/voip-initial-group-call.md#L63-L101
 	devices, err := e.c.wa.GetUserDevices(ctx, users)
+	allSelfDevices := offerAllDevices
+	if err != nil && offerAllDevices && len(users) > 1 {
+		// Falha ao listar os nossos devices nao pode derrubar a chamada: refaz so com os
+		// alvos e oferece apenas o gateway no nosso usuario.
+		e.c.log.Warn().Err(err).Msg("group offer: self device discovery failed, using gateway only")
+		devices, err = e.c.wa.GetUserDevices(ctx, users[1:])
+		allSelfDevices = false
+	}
 	if err != nil {
 		return nil, fmt.Errorf("meowcaller: group device discovery: %w", err)
 	}
@@ -303,7 +312,11 @@ func (e *engine) discoverGroupParticipants(
 		byUser[user] = append(byUser[user], device)
 	}
 	self := e.c.wa.Store.GetLID()
-	byUser[self.ToNonAD()] = ensureSelfDevice(byUser[self.ToNonAD()], self)
+	if allSelfDevices {
+		byUser[self.ToNonAD()] = ensureSelfDevice(byUser[self.ToNonAD()], self)
+	} else {
+		byUser[self.ToNonAD()] = []types.JID{self}
+	}
 	participants := make([]signaling.GroupCallParticipant, 0, len(users))
 	for _, user := range users {
 		user = user.ToNonAD()

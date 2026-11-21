@@ -44,6 +44,10 @@ type GroupCallOptions struct {
 	GroupJID string
 	// Video advertises an H.264 group video call.
 	Video bool
+	// OfferAllDevices lists every device of our own user in the offer (gateway keeps the
+	// capability). Default false keeps the historical behavior of listing only the
+	// gateway device. On a device-discovery error it falls back to the gateway only.
+	OfferAllDevices bool
 }
 
 // NewClient wraps a connected whatsmeow client and installs the call event handlers.
