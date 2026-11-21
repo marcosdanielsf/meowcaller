@@ -297,3 +297,9 @@ func TestUnauthenticatedStaircaseCannotAdvanceROCWithoutCommit(t *testing.T) {
 		t.Fatalf("committed staircase ROC = %d, want 1", rx.roc)
 	}
 }
+
+func TestAesCmKdfSaltCurtoRetornaErroSemPanic(t *testing.T) {
+	if _, err := aesCmKdf(make([]byte, 16), make([]byte, 5), 0, 16); !errors.Is(err, errShortSalt) {
+		t.Fatalf("err = %v, want %v", err, errShortSalt)
+	}
+}

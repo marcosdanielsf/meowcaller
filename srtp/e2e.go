@@ -15,6 +15,10 @@ import (
 // 32-byte minimum the E2E derivation requires.
 var errShortKey = errors.New("srtp: key material shorter than 32 bytes")
 
+// errShortSalt is returned when the master salt is shorter than the 14 bytes the AES-CM
+// PRF reads.
+var errShortSalt = errors.New("srtp: master salt shorter than 14 bytes")
+
 // E2eSrtpKeys holds the per-participant session keys for the end-to-end 1:1 SRTP
 // cipher: the AES-128 cipher key, the 14-byte master salt, and the auth key.
 type E2eSrtpKeys struct {
@@ -34,7 +38,7 @@ const (
 func aesCmKdf(masterKey, masterSalt []byte, label byte, length int) ([]byte, error) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/e2e_srtp.rs#L24-L32
 	if len(masterSalt) < 14 {
-		return nil, errShortKey
+		return nil, errShortSalt
 	}
 	var iv [16]byte
 	copy(iv[:14], masterSalt[:14])
